@@ -1,0 +1,10 @@
+# lokalna konfiguracja narzędzi / edytora
+.claude/
+.vercel/
+
+# zależności (nie są potrzebne — apka to jeden plik)
+node_modules/
+
+# system
+Thumbs.db
+.DS_Store

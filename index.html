@@ -1,0 +1,481 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<title>ChromaDepth Mandala Generator</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,Segoe UI,sans-serif}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  canvas{max-width:100vw;max-height:100vh;display:block;background:#000}
+  #ui{position:fixed;left:12px;top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+      background:rgba(10,10,14,.85);border:1px solid #333;border-radius:10px;padding:8px 10px;
+      color:#ccc;font-size:13px;z-index:10}
+  #ui input,#ui select,#ui button{background:#16161c;color:#eee;border:1px solid #444;border-radius:6px;padding:5px 9px;font-size:13px}
+  #ui button{cursor:pointer}
+  #ui button:hover{border-color:#999}
+  #ui button.rec{background:#5a1111;border-color:#a33}
+  #seed{width:100px}
+  #status{color:#7c7}
+  #ui label{display:flex;align-items:center;gap:5px;color:#aaa}
+  #ui input[type=range]{width:90px;padding:0}
+  #ui label span{color:#ddd;min-width:34px}
+  #hint{position:fixed;right:12px;bottom:10px;color:#555;font-size:12px;z-index:10}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="ui">
+  <input id="seed" placeholder="seed" spellcheck="false">
+  <button id="apply" title="Wygeneruj mandalę z wpisanego seeda">Zastosuj</button>
+  <button id="newSeed" title="Losowy seed">&#127922; Nowa mandala</button>
+  <select id="res" title="Rozdzielczość">
+    <option value="1920x1080" selected>1920&times;1080</option>
+    <option value="1080x1080">1080&times;1080</option>
+    <option value="1080x1920">1080&times;1920</option>
+  </select>
+  <button id="play" title="Pauza / wznów">&#9208;</button>
+  <select id="dur" title="Długość nagrania (s)">
+    <option value="5">5 s</option>
+    <option value="10" selected>10 s</option>
+    <option value="15">15 s</option>
+    <option value="30">30 s</option>
+    <option value="60">60 s</option>
+  </select>
+  <button id="rec">&#9210; Nagraj WebM</button>
+  <button id="png" title="Zapisz klatkę jako PNG">PNG</button>
+  <label title="Tempo ekspansji warstw na zewnątrz">ekspansja
+    <input type="range" id="expS" min="0" max="3" step="0.1" value="1"><span id="expV">1.0</span></label>
+  <label title="Długość przejścia między mandalami">przejście
+    <input type="range" id="trS" min="0.3" max="5" step="0.1" value="2"><span id="trV">2.0 s</span></label>
+  <label title="Gęstość: liczba warstw i linii (przebudowuje mandalę)">gęstość
+    <input type="range" id="denS" min="0.4" max="1.8" step="0.1" value="1"><span id="denV">1.0</span></label>
+  <span id="status"></span>
+</div>
+<div id="hint">N = nowa mandala &middot; spacja = pauza</div>
+<script>
+'use strict';
+const TAU = Math.PI * 2;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const seedInput = document.getElementById('seed');
+const statusEl = document.getElementById('status');
+
+/* ---------- deterministyczny RNG ---------- */
+function hashSeed(str){
+  let h = 1779033703 ^ str.length;
+  for(let i = 0; i < str.length; i++){
+    h = Math.imul(h ^ str.charCodeAt(i), 3432918353);
+    h = h << 13 | h >>> 19;
+  }
+  h = Math.imul(h ^ h >>> 16, 2246822507);
+  h = Math.imul(h ^ h >>> 13, 3266489909);
+  return (h ^ h >>> 16) >>> 0;
+}
+function mulberry32(a){
+  return function(){
+    a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+/* ---------- scena ---------- */
+let W = 1920, H = 1080;
+let scene = null;
+
+// ChromaDepth: głębia 0 (blisko) = czerwień 0°, głębia 1 (daleko) = błękit ~250°
+const clampHue = h => Math.max(0, Math.min(250, h));
+// odchylenie ku skrajom spektrum: czerwień i błękit kontrastują najlepiej, żółto-zielony środek ściśnięty
+const hueOf = d => 250 * (0.5 + 0.5 * Math.sign(2*d - 1) * Math.pow(Math.abs(2*d - 1), 0.45));
+
+function buildScene(seedStr){
+  const rnd = mulberry32(hashSeed(seedStr));
+  const R  = (a,b) => a + rnd()*(b-a);
+  const RI = (a,b) => Math.floor(R(a, b + 0.999));
+  const pick = arr => arr[Math.floor(rnd()*arr.length)];
+
+  const S = RI(4, 9);                 // krotność symetrii
+  const unit = Math.min(W, H) * 0.55; // promień odniesienia
+  const layers = [];
+  const dcnt = (a, b) => Math.max(1, Math.round(RI(a, b) * density)); // liczności skalowane suwakiem gęstości
+
+  // --- poszarpane pierścienie (zamknięte, symetria przez harmoniczne wielokrotności S)
+  // każda warstwa ma dwa warianty kształtu (A/B) i morfuje między nimi w pętli
+  const mkHarm = (nh, amp) => {
+    const h = [];
+    for(let k = 0; k < nh; k++) h.push({ f: S * RI(1, 14), a: amp * R(0.02, 0.10), p: R(0, TAU), s: R(-1.2, 1.2) });
+    return h;
+  };
+  const nRings = dcnt(2, 4);
+  for(let i = 0; i < nRings; i++){
+    const base = unit * (0.10 + 0.45 * (i + R(0, 0.8)) / nRings); // promienie rozłożone pasmami
+    const nh = RI(3, 5);
+    layers.push({ type:'ring', R: base, harm: mkHarm(nh, base), harm2: mkHarm(nh, base),
+      nLines: dcnt(2, 4), gap: R(4, 8)*unit/540,
+      depth: rnd(), hueStep: R(-6, 6), lw: R(1.5, 3), rotSpeed: R(-0.15, 0.15),
+      morphW: R(0.06, 0.25), morphP: R(0, TAU),
+      oscA: base * R(0, 0.05), oscW: R(0.2, 0.8), oscP: R(0, TAU), N: 320 });
+  }
+
+  // --- płomykowate bloby wokół środka (powtarzane S razy)
+  const mkBlobHarm = (nh, r0) => {
+    const h = [];
+    for(let k = 0; k < nh; k++) h.push({ f: RI(2, 9), a: r0 * R(0.12, 0.45), p: R(0, TAU), s: R(-1.5, 1.5) });
+    return h;
+  };
+  const nBlobs = dcnt(1, 2);
+  for(let i = 0; i < nBlobs; i++){
+    const r0 = unit * R(0.06, 0.14);
+    const nh = RI(3, 5);
+    layers.push({ type:'blob', dist: unit * R(0.2, 0.6), r0,
+      harm: mkBlobHarm(nh, r0), harm2: mkBlobHarm(nh, r0), nLines: dcnt(1, 3),
+      gap: R(2.5, 5)*unit/540, depth: rnd(), hueStep: R(-5, 5), lw: R(1.5, 2.5),
+      morphW: R(0.06, 0.25), morphP: R(0, TAU),
+      rotSpeed: R(-0.2, 0.2), spin: R(-0.6, 0.6), ang0: R(0, TAU), N: 160 });
+  }
+
+  // --- schodkowe meandry (ramiona z wiązką równoległych linii + gradient hue)
+  const nArms = dcnt(1, 3);
+  for(let i = 0; i < nArms; i++){
+    const L = unit * R(0.30, 0.70);
+    // dwa warianty schodków na wspólnych pozycjach x — morfing zachowuje kąty proste
+    const pts = [[0, 0]], pts2 = [[0, 0]];
+    let x = 0, yA = 0, yB = 0, dirA = pick([1, -1]), dirB = pick([1, -1]);
+    while(x < L){
+      const w = L * R(0.03, 0.12);
+      x += w; pts.push([x, yA]); pts2.push([x, yB]);
+      if(rnd() < 0.85){
+        yA += unit * R(0.02, 0.09) * dirA;
+        yB += unit * R(0.02, 0.09) * dirB;
+        pts.push([x, yA]); pts2.push([x, yB]);
+        if(rnd() < 0.45) dirA = -dirA;
+        if(rnd() < 0.45) dirB = -dirB;
+      }
+    }
+    layers.push({ type:'poly', pts, pts2, morphW: R(0.06, 0.25), morphP: R(0, TAU),
+      nLines: Math.max(2, dcnt(4, 8)), gap: R(5, 9)*unit/540,
+      depth: rnd(), hueStep: R(2.5, 8) * pick([1, -1]), lw: R(1.6, 2.6),
+      dist: unit * (0.35 + 0.45 * (i + R(0, 0.8)) / nArms), ang0: R(0, TAU), tilt: Math.PI/2 + R(-0.5, 0.5),
+      rotSpeed: R(-0.12, 0.12), dash: [R(30, 120), R(4, 14)], dashSpeed: R(20, 80) * pick([1, -1]) });
+  }
+
+  // --- grzebienie / kody kreskowe
+  const mkTeeth = nT => {
+    const teeth = [];
+    let len = unit * R(0.05, 0.15);
+    for(let k = 0; k < nT; k++){
+      len = Math.max(unit*0.02, Math.min(unit*0.30, len + unit * R(-0.05, 0.05)));
+      teeth.push(len);
+    }
+    return teeth;
+  };
+  const nCombs = dcnt(1, 2);
+  for(let i = 0; i < nCombs; i++){
+    const L = unit * R(0.25, 0.60);
+    const nT = RI(8, 22);
+    layers.push({ type:'comb', L, teeth: mkTeeth(nT), teeth2: mkTeeth(nT),
+      morphW: R(0.06, 0.25), morphP: R(0, TAU),
+      side: pick([1, -1]), depth: rnd(), hueStep: R(-1.2, 1.2),
+      lw: R(2, 3.2), dist: unit * R(0.45, 0.95), ang0: R(0, TAU), tilt: Math.PI/2 + R(-0.6, 0.6),
+      rotSpeed: R(-0.10, 0.10), dash: [R(40, 140), R(4, 12)], dashSpeed: R(15, 60) * pick([1, -1]),
+      wob: R(0.02, 0.15), wobW: R(0.3, 1.0) });
+  }
+
+  // --- szprychy z poprzeczką
+  const nSpokes = dcnt(1, 2);
+  for(let i = 0; i < nSpokes; i++){
+    layers.push({ type:'spoke', r1: unit * R(0.15, 0.50), r2: unit * R(0.60, 1.00),
+      r1b: unit * R(0.15, 0.50), r2b: unit * R(0.60, 1.00),
+      cap: unit * R(0.02, 0.06), capb: unit * R(0.02, 0.06),
+      morphW: R(0.06, 0.25), morphP: R(0, TAU),
+      depth: rnd(), lw: R(2, 3.2), rotSpeed: R(-0.15, 0.15),
+      ang0: R(0, TAU), dash: [R(60, 200), R(6, 16)], dashSpeed: R(20, 70) * pick([1, -1]) });
+  }
+
+  // rozkład warstwowy głębi: pełne spektrum czerwień→błękit w każdym seedzie
+  const n = layers.length;
+  const depths = [];
+  for(let i = 0; i < n; i++) depths.push((i + rnd() * 0.8) / n);
+  for(let i = depths.length - 1; i > 0; i--){ // tasowanie Fishera-Yatesa
+    const j = Math.floor(rnd() * (i + 1));
+    [depths[i], depths[j]] = [depths[j], depths[i]];
+  }
+  layers.forEach((l, i) => { l.depth = depths[i]; });
+
+  // faza ekspansji: każda warstwa dryfuje od środka na zewnątrz i zawija się z powrotem
+  layers.forEach(l => { l.expPhase = rnd(); });
+
+  // dalekie (niebieskie) pod spodem, bliskie (czerwone) na wierzchu — poprawna okluzja dla ChromaDepth
+  layers.sort((a, b) => b.depth - a.depth);
+
+  return { S, layers, globalRot: R(-0.05, 0.05), breathA: R(0.01, 0.04), breathW: R(0.15, 0.4),
+    expSpeed: R(0.012, 0.03) }; // cykle ekspansji na sekundę
+}
+
+/* ---------- rysowanie ---------- */
+let layerAlpha = 1; // mnożnik krycia: zanik ekspansji + crossfade przejścia między mandalami
+function strokeTwice(build, hue, lw, alpha){
+  const a = (alpha === undefined ? 1 : alpha) * layerAlpha;
+  ctx.strokeStyle = `hsla(${hue},100%,55%,${0.09*a})`; // tani neon: szeroki, półprzezroczysty spód
+  ctx.lineWidth = lw * 2.6;
+  ctx.beginPath(); build(); ctx.stroke();
+  ctx.strokeStyle = `hsla(${hue},100%,58%,${a})`;
+  ctx.lineWidth = lw;
+  ctx.beginPath(); build(); ctx.stroke();
+}
+
+const morphMix = (l, t) => 0.5 + 0.5 * Math.sin(l.morphW * t + l.morphP);
+
+function drawRing(l, t){
+  const osc = l.oscA * Math.sin(l.oscW * t + l.oscP);
+  const m = morphMix(l, t);
+  for(let j = 0; j < l.nLines; j++){
+    const hue = clampHue(hueOf(l.depth) + j * l.hueStep);
+    strokeTwice(() => {
+      for(let i = 0; i <= l.N; i++){
+        const th = i / l.N * TAU;
+        let rA = 0, rB = 0;
+        for(const hm of l.harm)  rA += hm.a * Math.sin(hm.f * th + hm.p + hm.s * t);
+        for(const hm of l.harm2) rB += hm.a * Math.sin(hm.f * th + hm.p + hm.s * t);
+        const r = l.R + j * l.gap + osc + m * rA + (1 - m) * rB;
+        const px = r * Math.cos(th), py = r * Math.sin(th);
+        i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+      }
+    }, hue, l.lw);
+  }
+}
+
+function drawBlob(l, t){
+  ctx.translate(l.dist, 0);
+  ctx.rotate(l.spin * t);
+  const m = morphMix(l, t);
+  for(let j = 0; j < l.nLines; j++){
+    const hue = clampHue(hueOf(l.depth) + j * l.hueStep);
+    strokeTwice(() => {
+      for(let i = 0; i <= l.N; i++){
+        const th = i / l.N * TAU;
+        let rA = 0, rB = 0;
+        for(const hm of l.harm)  rA += hm.a * Math.sin(hm.f * th + hm.p + hm.s * t);
+        for(const hm of l.harm2) rB += hm.a * Math.sin(hm.f * th + hm.p + hm.s * t);
+        const r = l.r0 + j * l.gap + m * rA + (1 - m) * rB;
+        const px = r * Math.cos(th), py = r * Math.sin(th);
+        i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+      }
+    }, hue, l.lw);
+  }
+}
+
+function drawPoly(l, t){
+  ctx.translate(l.dist, 0);
+  ctx.rotate(l.tilt);
+  ctx.setLineDash(l.dash);
+  for(let j = 0; j < l.nLines; j++){
+    ctx.lineDashOffset = -l.dashSpeed * t + j * 9;
+    const hue = clampHue(hueOf(l.depth) + j * l.hueStep);
+    const oy = j * l.gap;
+    const m = morphMix(l, t);
+    strokeTwice(() => {
+      l.pts.forEach((p, i) => {
+        const y = m * p[1] + (1 - m) * l.pts2[i][1] + oy;
+        i ? ctx.lineTo(p[0], y) : ctx.moveTo(p[0], y);
+      });
+    }, hue, l.lw);
+  }
+  ctx.setLineDash([]);
+}
+
+function drawComb(l, t){
+  ctx.translate(l.dist, 0);
+  ctx.rotate(l.tilt);
+  const h0 = hueOf(l.depth);
+  ctx.setLineDash(l.dash);
+  ctx.lineDashOffset = -l.dashSpeed * t;
+  strokeTwice(() => { ctx.moveTo(0, 0); ctx.lineTo(l.L, 0); }, clampHue(h0), l.lw);
+  ctx.setLineDash([]);
+  const n = l.teeth.length;
+  const m = morphMix(l, t);
+  for(let k = 0; k < n; k++){
+    const x = (k + 0.5) / n * l.L;
+    const base = m * l.teeth[k] + (1 - m) * l.teeth2[k];
+    const len = base * (1 + l.wob * Math.sin(l.wobW * t + k * 0.7));
+    strokeTwice(() => { ctx.moveTo(x, 0); ctx.lineTo(x, l.side * len); }, clampHue(h0 + l.hueStep * k), l.lw);
+  }
+}
+
+function drawSpoke(l, t){
+  const hue = clampHue(hueOf(l.depth));
+  const m = morphMix(l, t);
+  const r1 = m * l.r1 + (1 - m) * l.r1b;
+  const r2 = m * l.r2 + (1 - m) * l.r2b;
+  const cap = m * l.cap + (1 - m) * l.capb;
+  ctx.setLineDash(l.dash);
+  ctx.lineDashOffset = -l.dashSpeed * t;
+  strokeTwice(() => { ctx.moveTo(r1, 0); ctx.lineTo(r2, 0); }, hue, l.lw);
+  ctx.setLineDash([]);
+  strokeTwice(() => { ctx.moveTo(r2, -cap); ctx.lineTo(r2, cap); }, hue, l.lw);
+}
+
+function drawScene(sc, t, sceneAlpha, extraScale){
+  ctx.save();
+  ctx.translate(W/2, H/2);
+  ctx.rotate(sc.globalRot * t);
+  const br = (1 + sc.breathA * Math.sin(sc.breathW * t)) * extraScale;
+  ctx.scale(br, br);
+  const S = sc.S;
+  for(const l of sc.layers){
+    // ekspansja: warstwa rośnie wykładniczo od środka na zewnątrz i zawija się z zanikiem
+    const u = (l.expPhase + expT * sc.expSpeed) % 1;
+    const f = 0.35 * Math.pow(1.75 / 0.35, u);
+    let fade = 1;
+    if(u < 0.15) fade = u / 0.15;
+    else if(u > 0.85) fade = (1 - u) / 0.15;
+    layerAlpha = sceneAlpha * fade;
+    if(layerAlpha < 0.004) continue;
+    ctx.save();
+    ctx.scale(f, f);
+    ctx.rotate((l.rotSpeed || 0) * t + (l.ang0 || 0));
+    if(l.type === 'ring'){
+      drawRing(l, t);
+    } else {
+      for(let i = 0; i < S; i++){
+        ctx.save();
+        ctx.rotate(i * TAU / S);
+        if(l.type === 'blob') drawBlob(l, t);
+        else if(l.type === 'poly') drawPoly(l, t);
+        else if(l.type === 'comb') drawComb(l, t);
+        else if(l.type === 'spoke') drawSpoke(l, t);
+        ctx.restore();
+      }
+    }
+    ctx.restore();
+  }
+  ctx.restore();
+  layerAlpha = 1;
+}
+
+/* ---------- pętla ---------- */
+let playing = true, simT = 0, last = performance.now();
+let oldScene = null, transStart = 0, transCurDur = 2;
+let expT = 0, expMul = 1, density = 1, transDur = 2; // sterowane suwakami
+function frame(now){
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if(playing){
+    simT += dt;
+    expT += dt * expMul; // osobny zegar ekspansji — zmiana tempa suwakiem nie powoduje skoku
+  }
+  if(scene){
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    if(oldScene){
+      const p = Math.min(1, (simT - transStart) / transCurDur);
+      const e = p * p * (3 - 2 * p); // smoothstep
+      drawScene(oldScene, simT, 1 - e, 1 + 0.35 * e); // stara: rozszerza się i gaśnie
+      drawScene(scene, simT, e, 0.7 + 0.3 * e);       // nowa: wyłania się i doskala
+      if(p >= 1) oldScene = null;
+    } else {
+      drawScene(scene, simT, 1, 1);
+    }
+  }
+  requestAnimationFrame(frame);
+}
+
+/* ---------- UI ---------- */
+function randomSeed(){ return Math.random().toString(36).slice(2, 8); }
+
+function setSeed(s){
+  seedInput.value = s;
+  if(scene){ oldScene = scene; transStart = simT; transCurDur = transDur; } // crossfade ze starej mandali
+  scene = buildScene(s);
+  statusEl.textContent = `seed: ${s} · symetria ${scene.S}× · warstw ${scene.layers.length}`;
+  try { history.replaceState(null, '', '?seed=' + encodeURIComponent(s)); } catch(e){}
+}
+
+function setResolution(val){
+  const [w, h] = val.split('x').map(Number);
+  W = w; H = h;
+  canvas.width = W; canvas.height = H;
+  if(seedInput.value) scene = buildScene(seedInput.value); // unit zależy od rozmiaru
+}
+
+document.getElementById('newSeed').onclick = () => setSeed(randomSeed());
+document.getElementById('apply').onclick = () => setSeed(seedInput.value.trim() || randomSeed());
+seedInput.addEventListener('keydown', e => { if(e.key === 'Enter') setSeed(seedInput.value.trim() || randomSeed()); });
+document.getElementById('res').onchange = e => setResolution(e.target.value);
+const playBtn = document.getElementById('play');
+playBtn.onclick = () => { playing = !playing; playBtn.textContent = playing ? '⏸' : '▶'; };
+
+const expS = document.getElementById('expS'), expV = document.getElementById('expV');
+const trS = document.getElementById('trS'), trV = document.getElementById('trV');
+const denS = document.getElementById('denS'), denV = document.getElementById('denV');
+expS.oninput = () => { expMul = +expS.value; expV.textContent = expMul.toFixed(1); };
+trS.oninput = () => { transDur = +trS.value; trV.textContent = transDur.toFixed(1) + ' s'; };
+denS.oninput = () => { denV.textContent = (+denS.value).toFixed(1); };
+denS.onchange = () => { // przebudowa dopiero po puszczeniu suwaka, z łagodnym przejściem
+  density = +denS.value;
+  if(seedInput.value) setSeed(seedInput.value);
+};
+
+window.addEventListener('keydown', e => {
+  if(e.target === seedInput) return;
+  if(e.key === 'n' || e.key === 'N') setSeed(randomSeed());
+  if(e.key === ' '){ e.preventDefault(); playBtn.onclick(); }
+});
+
+/* ---------- nagrywanie ---------- */
+let recorder = null, recTimer = null, recTick = null;
+const recBtn = document.getElementById('rec');
+recBtn.onclick = () => {
+  if(recorder){ recorder.stop(); return; }
+  const stream = canvas.captureStream(60);
+  const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm';
+  recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 24000000 });
+  const chunks = [];
+  recorder.ondataavailable = e => { if(e.data.size) chunks.push(e.data); };
+  recorder.onstop = () => {
+    clearTimeout(recTimer); clearInterval(recTick);
+    const blob = new Blob(chunks, { type: 'video/webm' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `mandala-${seedInput.value}-${W}x${H}.webm`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    recorder = null;
+    recBtn.textContent = '⏺ Nagraj WebM';
+    recBtn.classList.remove('rec');
+    statusEl.textContent = `zapisano: ${a.download}`;
+  };
+  const secs = +document.getElementById('dur').value;
+  const tEnd = performance.now() + secs * 1000;
+  recorder.start();
+  recBtn.textContent = '⏹ Stop';
+  recBtn.classList.add('rec');
+  recTick = setInterval(() => {
+    statusEl.textContent = `nagrywanie... ${Math.max(0, (tEnd - performance.now()) / 1000).toFixed(1)} s`;
+  }, 100);
+  recTimer = setTimeout(() => { if(recorder) recorder.stop(); }, secs * 1000);
+};
+
+document.getElementById('png').onclick = () => {
+  canvas.toBlob(blob => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `mandala-${seedInput.value}-${W}x${H}.png`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+};
+
+/* ---------- start ---------- */
+setResolution('1920x1080');
+const urlSeed = new URLSearchParams(location.search).get('seed');
+setSeed(urlSeed || randomSeed());
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
