@@ -46,6 +46,7 @@
   </select>
   <button id="rec">&#9210; Nagraj WebM</button>
   <button id="png" title="Zapisz klatkę jako PNG">PNG</button>
+  <label title="Neonowa poświata — wyłącz, jeśli animacja się przycina">&#10024;<input type="checkbox" id="glowChk" checked></label>
   <label title="Prędkość lotu">tempo
     <input type="range" id="spdS" min="0" max="3" step="0.1" value="1"><span id="spdV">1.0</span></label>
   <label title="Jak mocno tunel się wije">skręt
@@ -59,7 +60,7 @@
 'use strict';
 const TAU = Math.PI * 2;
 const canvas = document.getElementById('c');
-const ctx = canvas.getContext('2d');
+const ctx = canvas.getContext('2d', { alpha: false }); // nieprzezroczysta kanwa = szybszy compositing
 const seedInput = document.getElementById('seed');
 const statusEl = document.getElementById('status');
 
@@ -185,11 +186,12 @@ function shapeAt(sc, n, theta, t){
 }
 
 /* ---------- rysowanie ---------- */
+let glowOn = true; // przełącznik ✨ — poświata to ~połowa kosztu rysowania
 function strokeTwice(build, hue, lw, alpha){
   const a = (alpha === undefined ? 1 : alpha) * layerAlpha;
   const p = new Path2D();          // geometria liczona RAZ, pociągnięta dwa razy
   build(p);
-  if(a > 0.3){                     // poświata tylko gdy element wyraźny — dalekie i tak jej nie pokażą
+  if(glowOn && a > 0.3){           // poświata tylko gdy element wyraźny — dalekie i tak jej nie pokażą
     ctx.strokeStyle = `hsla(${hue},100%,55%,${0.09*a})`;
     ctx.lineWidth = lw * 2.2;
     ctx.stroke(p);
@@ -390,6 +392,7 @@ const denS = document.getElementById('denS'), denV = document.getElementById('de
 spdS.oninput = () => { speedMul = +spdS.value; spdV.textContent = speedMul.toFixed(1); };
 crvS.oninput = () => { curvTarget = +crvS.value; crvV.textContent = curvTarget.toFixed(1); };
 denS.oninput = () => { density = +denS.value; denV.textContent = density.toFixed(1); };
+document.getElementById('glowChk').onchange = e => { glowOn = e.target.checked; };
 
 window.addEventListener('keydown', e => {
   if(e.target === seedInput) return;
