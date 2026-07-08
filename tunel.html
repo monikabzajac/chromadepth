@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<title>ChromaDepth Wormhole</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,Segoe UI,sans-serif}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  canvas{max-width:100vw;max-height:100vh;display:block;background:#000}
+  #ui{position:fixed;left:12px;top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+      background:rgba(10,10,14,.85);border:1px solid #333;border-radius:10px;padding:8px 10px;
+      color:#ccc;font-size:13px;z-index:10}
+  #ui input,#ui select,#ui button{background:#16161c;color:#eee;border:1px solid #444;border-radius:6px;padding:5px 9px;font-size:13px}
+  #ui button{cursor:pointer}
+  #ui button:hover{border-color:#999}
+  #ui button.rec{background:#5a1111;border-color:#a33}
+  #seed{width:100px}
+  #status{color:#7c7}
+  #ui label{display:flex;align-items:center;gap:5px;color:#aaa}
+  #ui input[type=range]{width:90px;padding:0}
+  #ui label span{color:#ddd;min-width:34px}
+  #hint{position:fixed;right:12px;bottom:10px;color:#555;font-size:12px;z-index:10}
+  #ui a.home{background:#16161c;color:#eee;border:1px solid #444;border-radius:6px;padding:5px 9px;font-size:13px;text-decoration:none}
+  #ui a.home:hover{border-color:#999}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="ui">
+  <a class="home" href="index.html" title="Wróć do menu">&#9776;</a>
+  <input id="seed" placeholder="seed" spellcheck="false">
+  <button id="apply" title="Wygeneruj tunel z wpisanego seeda">Zastosuj</button>
+  <button id="newSeed" title="Losowy seed">&#127922; Nowy tunel</button>
+  <select id="res" title="Rozdzielczość">
+    <option value="1920x1080" selected>1920&times;1080</option>
+    <option value="1080x1080">1080&times;1080</option>
+    <option value="1080x1920">1080&times;1920</option>
+  </select>
+  <button id="play" title="Pauza / wznów">&#9208;</button>
+  <select id="dur" title="Długość nagrania (s)">
+    <option value="5">5 s</option>
+    <option value="10" selected>10 s</option>
+    <option value="15">15 s</option>
+    <option value="30">30 s</option>
+    <option value="60">60 s</option>
+  </select>
+  <button id="rec">&#9210; Nagraj WebM</button>
+  <button id="png" title="Zapisz klatkę jako PNG">PNG</button>
+  <label title="Prędkość lotu">tempo
+    <input type="range" id="spdS" min="0" max="3" step="0.1" value="1"><span id="spdV">1.0</span></label>
+  <label title="Jak mocno tunel się wije">skręt
+    <input type="range" id="crvS" min="0" max="2" step="0.1" value="1"><span id="crvV">1.0</span></label>
+  <label title="Głębia widoku, żebra i obiekty">gęstość
+    <input type="range" id="denS" min="0.5" max="2" step="0.1" value="1"><span id="denV">1.0</span></label>
+  <span id="status"></span>
+</div>
+<div id="hint">N = nowy tunel &middot; spacja = pauza</div>
+<script>
+'use strict';
+const TAU = Math.PI * 2;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const seedInput = document.getElementById('seed');
+const statusEl = document.getElementById('status');
+
+/* ---------- deterministyczny RNG ---------- */
+function hashSeed(str){
+  let h = 1779033703 ^ str.length;
+  for(let i = 0; i < str.length; i++){
+    h = Math.imul(h ^ str.charCodeAt(i), 3432918353);
+    h = h << 13 | h >>> 19;
+  }
+  h = Math.imul(h ^ h >>> 16, 2246822507);
+  h = Math.imul(h ^ h >>> 13, 3266489909);
+  return (h ^ h >>> 16) >>> 0;
+}
+function mulberry32(a){
+  return function(){
+    a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+/* ---------- stan ---------- */
+let W = 1920, H = 1080, FOCAL = 660;
+let scene = null, oldScene = null, transStart = 0, transCurDur = 2;
+let playing = true, simT = 0, flyT = 0, last = performance.now();
+let speedMul = 1, curvTarget = 1, curCurv = 1, density = 1;
+let layerAlpha = 1;
+
+// ChromaDepth: blisko = czerwień 0°, daleko = błękit 250°; środek spektrum ściśnięty
+const clampHue = h => Math.max(0, Math.min(250, h));
+function hueFromScreenR(Rs){
+  // kolor z rozmiaru NA EKRANIE: pierścień sięgający krawędzi kadru = czerwony (blisko),
+  // malutki w centrum = błękit (daleko). Gwarantuje pełne spektrum w każdej klatce.
+  const mn = Math.min(W, H);
+  let hf = (Math.log(0.5*mn) - Math.log(Math.max(Rs, 1))) / (Math.log(0.5*mn) - Math.log(0.04*mn));
+  hf = Math.max(0, Math.min(1, hf));
+  const g = 0.5 + 0.5 * Math.sign(2*hf - 1) * Math.pow(Math.abs(2*hf - 1), 0.55);
+  return 250 * g;
+}
+
+/* ---------- scena (tunel) ---------- */
+function buildScene(seedStr){
+  const h = hashSeed(seedStr);
+  const rnd = mulberry32(h);
+  const R  = (a,b) => a + rnd()*(b-a);
+  const RI = (a,b) => Math.floor(R(a, b + 0.999));
+  return {
+    hash: h, seed: seedStr,
+    spacing: R(0.75, 1.0),          // odstęp pierścieni (jednostki świata)
+    zNear: 0.32, zFarBase: R(24, 36),
+    baseRadius: R(2.3, 3.3),
+    radiusWaveA: R(0.05, 0.35), radiusWaveF: R(0.05, 0.18), // oddech średnicy tuby wzdłuż z
+    pathAmp: [R(1.6, 4.2), R(1.6, 4.2)],
+    pathF:  [R(0.03, 0.08), R(0.025, 0.07)],
+    pathP:  [R(0, TAU), R(0, TAU)],
+    path2A: [R(0.3, 1.0), R(0.3, 1.0)],
+    path2F: [R(0.10, 0.22), R(0.09, 0.20)],
+    speed: R(2.2, 3.6),
+    roll: R(-0.10, 0.10),           // powolny obrót kamery
+    segLen: RI(22, 40),             // pierścieni na jeden motyw ("rozdział")
+    twist: R(-0.22, 0.22),          // przesunięcie fazy między pierścieniami → spirala
+    pulseA: R(0.25, 0.5), pulseK: R(0.5, 1.2), pulseF: R(0.4, 1.1), // fala światła wzdłuż tuby
+    floaterSpacing: R(1.7, 2.8),
+    themeCache: new Map()
+  };
+}
+
+// oś tunelu w przestrzeni (wije się); curCurv — suwak skrętu (wygładzany)
+function pathAt(sc, z){
+  const c = curCurv;
+  return [
+    c * (sc.pathAmp[0]*Math.sin(z*sc.pathF[0] + sc.pathP[0]) + sc.path2A[0]*Math.sin(z*sc.path2F[0])),
+    c * (sc.pathAmp[1]*Math.sin(z*sc.pathF[1] + sc.pathP[1]) + sc.path2A[1]*Math.sin(z*sc.path2F[1]*1.13))
+  ];
+}
+
+// motyw segmentu: rodzina kształtów, harmoniczne, żebra — deterministycznie z indeksu
+function themeOf(sc, si){
+  let th = sc.themeCache.get(si);
+  if(th) return th;
+  const r = mulberry32((sc.hash ^ Math.imul(si + 1, 0x9E3779B1)) >>> 0);
+  const R = (a,b) => a + r()*(b-a);
+  const RI = (a,b) => Math.floor(R(a, b + 0.999));
+  const kind = ['wobble','poly','star','gear'][Math.floor(r()*4)];
+  const harm = [];
+  const nh = RI(2, 4);
+  for(let k = 0; k < nh; k++) harm.push({ f: RI(3, 9), a: R(0.03, 0.11), p: R(0, TAU), s: R(-0.8, 0.8) });
+  th = { kind, harm,
+    polyN: RI(3, 7), starN: RI(4, 9), starA: R(0.15, 0.4),
+    gearN: RI(6, 14), gearA: R(0.08, 0.2),
+    ribs: RI(6, 14), ribTwist: R(-0.022, 0.022), spin: R(-0.5, 0.5) };
+  sc.themeCache.set(si, th);
+  return th;
+}
+
+// mnożnik promienia pierścienia n pod kątem theta (kształt motywu + harmoniczne)
+function ringShape(sc, th, n, theta, t){
+  let r = 1;
+  for(const hm of th.harm) r += hm.a * Math.sin(hm.f*theta + hm.p + hm.s*t + n*sc.twist);
+  if(th.kind === 'poly'){
+    const N = th.polyN;
+    const a = ((theta + t*th.spin*0.4) % (TAU/N) + TAU/N) % (TAU/N) - Math.PI/N;
+    r *= Math.cos(Math.PI/N) / Math.cos(a);
+  } else if(th.kind === 'star'){
+    r *= 1 + th.starA * Math.cos(th.starN*theta + t*th.spin*2 + n*sc.twist*2);
+  } else if(th.kind === 'gear'){
+    r *= 1 + th.gearA * Math.tanh(3*Math.sin(th.gearN*theta + t*th.spin*2));
+  }
+  return r;
+}
+
+// kształt z płynnym przejściem między motywami na granicy segmentu
+function shapeAt(sc, n, theta, t){
+  const si = Math.floor(n / sc.segLen);
+  const u = (n - si*sc.segLen) / sc.segLen;
+  const r1 = ringShape(sc, themeOf(sc, si), n, theta, t);
+  if(u <= 0.8) return r1;
+  const w = (u - 0.8) / 0.2;
+  const r2 = ringShape(sc, themeOf(sc, si + 1), n, theta, t);
+  return r1*(1 - w) + r2*w;
+}
+
+/* ---------- rysowanie ---------- */
+function strokeTwice(build, hue, lw, alpha){
+  const a = (alpha === undefined ? 1 : alpha) * layerAlpha;
+  const p = new Path2D();          // geometria liczona RAZ, pociągnięta dwa razy
+  build(p);
+  if(a > 0.3){                     // poświata tylko gdy element wyraźny — dalekie i tak jej nie pokażą
+    ctx.strokeStyle = `hsla(${hue},100%,55%,${0.09*a})`;
+    ctx.lineWidth = lw * 2.2;
+    ctx.stroke(p);
+  }
+  ctx.strokeStyle = `hsla(${hue},100%,58%,${a})`;
+  ctx.lineWidth = lw;
+  ctx.stroke(p);
+}
+
+function tubeRadius(sc, z){
+  return sc.baseRadius * (1 + sc.radiusWaveA * Math.sin(z * sc.radiusWaveF));
+}
+
+// alfa pierścienia: mgła daleko, dochodzenie blisko, pulsująca fala światła
+function ringAlpha(sc, dz, z, t, zFarCur){
+  const fog = Math.min(1, (zFarCur - dz) / (zFarCur * 0.22));
+  const nf  = Math.min(1, (dz - sc.zNear) / 0.5);
+  const pulse = 1 + sc.pulseA * Math.sin(sc.pulseK * z - sc.pulseF * t * TAU);
+  return Math.min(1, Math.max(0, fog * nf * Math.max(0.3, Math.min(1.5, pulse))));
+}
+
+function drawTunnel(sc, t, alphaMul){
+  const zCam = flyT * sc.speed + 5;
+  const [camX, camY] = pathAt(sc, zCam);
+  const zFarCur = sc.zFarBase * (0.55 + 0.45 * density);
+  ctx.save();
+  ctx.translate(W/2, H/2);
+  ctx.rotate(sc.roll * t);
+  const n0 = Math.ceil((zCam + sc.zNear) / sc.spacing);
+  const n1 = Math.floor((zCam + zFarCur) / sc.spacing);
+
+  // pomocnik: punkt pierścienia n pod kątem theta, we współrzędnych ekranu
+  const ringPt = (n, theta) => {
+    const z = n * sc.spacing;
+    const s = FOCAL / (z - zCam);
+    const [px, py] = pathAt(sc, z);
+    const rr = tubeRadius(sc, z) * shapeAt(sc, n, theta, t) * s;
+    return [(px - camX)*s + rr*Math.cos(theta), (py - camY)*s + rr*Math.sin(theta)];
+  };
+
+  for(let n = n1; n >= n0; n--){ // od dalekich (błękit) do bliskich (czerwień) — okluzja
+    const z = n * sc.spacing;
+    const dz = z - zCam;
+    const a = ringAlpha(sc, dz, z, t, zFarCur) * alphaMul;
+    if(a < 0.012) continue;
+    const s = FOCAL / dz;
+    const hue = clampHue(hueFromScreenR(tubeRadius(sc, z) * s));
+    const lw = Math.max(0.5, Math.min(4.5, 0.02 * s));
+    layerAlpha = a;
+
+    // żebra do następnego pierścienia (helisa); przy twarzy pomijane — robiłyby cięciwy przez ekran
+    if(n < n1 && dz > 1.0){
+      const th = themeOf(sc, Math.floor(n / sc.segLen));
+      const K = Math.max(3, Math.round(th.ribs * density));
+      const sub = Math.max(1, Math.min(6, Math.ceil(5 / dz))); // blisko dzielimy żebro, żeby gięło się z perspektywą
+      const rows = [];
+      for(let j = 0; j < K; j++){
+        const pts = [];
+        for(let q = 0; q <= sub; q++){
+          const nf = n + q/sub;
+          pts.push(ringPt(nf, j/K*TAU + nf*th.ribTwist*TAU));
+        }
+        rows.push(pts);
+      }
+      strokeTwice(pp => {
+        for(const pts of rows){
+          pts.forEach((pt, i) => i ? pp.lineTo(pt[0], pt[1]) : pp.moveTo(pt[0], pt[1]));
+        }
+      }, hue, lw * 0.8);
+    }
+
+    // pierścień
+    const [px, py] = pathAt(sc, z);
+    const cx = (px - camX)*s, cy = (py - camY)*s;
+    const Rs = tubeRadius(sc, z) * s;
+    const P = Math.max(28, Math.min(110, Math.round(20 + s * 0.35)));
+    strokeTwice(pp => {
+      for(let i = 0; i <= P; i++){
+        const theta = i/P*TAU;
+        const rr = Rs * shapeAt(sc, n, theta, t);
+        const x = cx + rr*Math.cos(theta), y = cy + rr*Math.sin(theta);
+        i ? pp.lineTo(x, y) : pp.moveTo(x, y);
+      }
+    }, hue, lw);
+  }
+
+  // obiekty wewnątrz tunelu — przelatują obok, czerwienieją przy twarzy
+  const fs = sc.floaterSpacing / Math.max(0.6, density);
+  const m0 = Math.ceil((zCam + sc.zNear + 0.2) / fs);
+  const m1 = Math.floor((zCam + zFarCur) / fs);
+  for(let m = m1; m >= m0; m--){
+    const fr = mulberry32((sc.hash ^ Math.imul(m + 7, 0x85EBCA6B)) >>> 0);
+    const z = m * fs;
+    const dz = z - zCam;
+    const a = ringAlpha(sc, dz, z, t, zFarCur) * alphaMul;
+    if(a < 0.012) continue;
+    const s = FOCAL / dz;
+    const hue = clampHue(hueFromScreenR(tubeRadius(sc, z) * s));
+    const lw = Math.max(0.5, Math.min(4.5, 0.022 * s));
+    layerAlpha = a;
+    const ang = fr()*TAU + t * (fr()*0.4 - 0.2);          // powolny orbit wokół osi
+    const radF = 0.15 + fr()*0.5;
+    const size = (0.08 + fr()*0.22) * s;
+    const kind = Math.floor(fr()*3);
+    const spin = (fr()*2 - 1) * 1.5;
+    const [px, py] = pathAt(sc, z);
+    const rad = tubeRadius(sc, z) * radF * s;
+    const fx = (px - camX)*s + rad*Math.cos(ang);
+    const fy = (py - camY)*s + rad*Math.sin(ang);
+    strokeTwice(pp => {
+      if(kind === 0){ // mini-pierścień z falą
+        const q = 14;
+        for(let i = 0; i <= q; i++){
+          const b = i/q*TAU;
+          const rr = size * (1 + 0.3*Math.sin(3*b + t*spin*2));
+          const x = fx + rr*Math.cos(b), y = fy + rr*Math.sin(b);
+          i ? pp.lineTo(x, y) : pp.moveTo(x, y);
+        }
+      } else if(kind === 1){ // krzyżyk
+        const rot = t*spin;
+        for(let k = 0; k < 2; k++){
+          const b = rot + k*Math.PI/2;
+          pp.moveTo(fx - size*Math.cos(b), fy - size*Math.sin(b));
+          pp.lineTo(fx + size*Math.cos(b), fy + size*Math.sin(b));
+        }
+      } else { // trójkąt
+        const rot = t*spin;
+        for(let i = 0; i <= 3; i++){
+          const b = rot + i/3*TAU;
+          const x = fx + size*Math.cos(b), y = fy + size*Math.sin(b);
+          i ? pp.lineTo(x, y) : pp.moveTo(x, y);
+        }
+      }
+    }, hue, lw);
+  }
+
+  ctx.restore();
+  layerAlpha = 1;
+}
+
+/* ---------- pętla ---------- */
+function frame(now){
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if(playing){
+    simT += dt;
+    flyT += dt * speedMul;                       // osobny zegar lotu — suwak tempa bez skoków
+  }
+  curCurv += (curvTarget - curCurv) * Math.min(1, dt * 1.5); // wygładzony skręt
+  if(scene){
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    ctx.lineJoin = 'bevel'; // tańsze w rastrze niż 'round', wizualnie bez różnicy przy tych grubościach
+    ctx.lineCap = 'butt';
+    if(oldScene){
+      const p = Math.min(1, (simT - transStart) / transCurDur);
+      const e = p * p * (3 - 2 * p);
+      drawTunnel(oldScene, simT, 1 - e);
+      drawTunnel(scene, simT, e);
+      if(p >= 1) oldScene = null;
+    } else {
+      drawTunnel(scene, simT, 1);
+    }
+  }
+  requestAnimationFrame(frame);
+}
+
+/* ---------- UI ---------- */
+function randomSeed(){ return Math.random().toString(36).slice(2, 8); }
+
+function setSeed(s){
+  seedInput.value = s;
+  if(scene){ oldScene = scene; transStart = simT; transCurDur = 2; }
+  scene = buildScene(s);
+  statusEl.textContent = `seed: ${s}`;
+  try { history.replaceState(null, '', '?seed=' + encodeURIComponent(s)); } catch(e){}
+}
+
+function setResolution(val){
+  const [w, h] = val.split('x').map(Number);
+  W = w; H = h;
+  canvas.width = W; canvas.height = H;
+  FOCAL = Math.min(W, H) * 0.62;
+}
+
+document.getElementById('newSeed').onclick = () => setSeed(randomSeed());
+document.getElementById('apply').onclick = () => setSeed(seedInput.value.trim() || randomSeed());
+seedInput.addEventListener('keydown', e => { if(e.key === 'Enter') setSeed(seedInput.value.trim() || randomSeed()); });
+document.getElementById('res').onchange = e => setResolution(e.target.value);
+const playBtn = document.getElementById('play');
+playBtn.onclick = () => { playing = !playing; playBtn.textContent = playing ? '⏸' : '▶'; };
+
+const spdS = document.getElementById('spdS'), spdV = document.getElementById('spdV');
+const crvS = document.getElementById('crvS'), crvV = document.getElementById('crvV');
+const denS = document.getElementById('denS'), denV = document.getElementById('denV');
+spdS.oninput = () => { speedMul = +spdS.value; spdV.textContent = speedMul.toFixed(1); };
+crvS.oninput = () => { curvTarget = +crvS.value; crvV.textContent = curvTarget.toFixed(1); };
+denS.oninput = () => { density = +denS.value; denV.textContent = density.toFixed(1); };
+
+window.addEventListener('keydown', e => {
+  if(e.target === seedInput) return;
+  if(e.key === 'n' || e.key === 'N') setSeed(randomSeed());
+  if(e.key === ' '){ e.preventDefault(); playBtn.onclick(); }
+});
+
+/* ---------- nagrywanie ---------- */
+let recorder = null, recTimer = null, recTick = null;
+const recBtn = document.getElementById('rec');
+recBtn.onclick = () => {
+  if(recorder){ recorder.stop(); return; }
+  const stream = canvas.captureStream(60);
+  const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm';
+  recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 24000000 });
+  const chunks = [];
+  recorder.ondataavailable = e => { if(e.data.size) chunks.push(e.data); };
+  recorder.onstop = () => {
+    clearTimeout(recTimer); clearInterval(recTick);
+    const blob = new Blob(chunks, { type: 'video/webm' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `wormhole-${seedInput.value}-${W}x${H}.webm`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    recorder = null;
+    recBtn.textContent = '⏺ Nagraj WebM';
+    recBtn.classList.remove('rec');
+    statusEl.textContent = `zapisano: ${a.download}`;
+  };
+  const secs = +document.getElementById('dur').value;
+  const tEnd = performance.now() + secs * 1000;
+  recorder.start();
+  recBtn.textContent = '⏹ Stop';
+  recBtn.classList.add('rec');
+  recTick = setInterval(() => {
+    statusEl.textContent = `nagrywanie... ${Math.max(0, (tEnd - performance.now()) / 1000).toFixed(1)} s`;
+  }, 100);
+  recTimer = setTimeout(() => { if(recorder) recorder.stop(); }, secs * 1000);
+};
+
+document.getElementById('png').onclick = () => {
+  canvas.toBlob(blob => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `wormhole-${seedInput.value}-${W}x${H}.png`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+};
+
+/* ---------- start ---------- */
+setResolution('1920x1080');
+const urlSeed = new URLSearchParams(location.search).get('seed');
+setSeed(urlSeed || randomSeed());
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
