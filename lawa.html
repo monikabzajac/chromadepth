@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<title>ChromaDepth Lawa</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,Segoe UI,sans-serif}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  canvas{max-width:100vw;max-height:100vh;display:block;background:#000}
+  #ui{position:fixed;left:12px;top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+      background:rgba(10,10,14,.85);border:1px solid #333;border-radius:10px;padding:8px 10px;
+      color:#ccc;font-size:13px;z-index:10}
+  #ui input,#ui select,#ui button{background:#16161c;color:#eee;border:1px solid #444;border-radius:6px;padding:5px 9px;font-size:13px}
+  #ui button{cursor:pointer}
+  #ui button:hover{border-color:#999}
+  #ui button.rec{background:#5a1111;border-color:#a33}
+  #seed{width:100px}
+  #status{color:#7c7}
+  #ui label{display:flex;align-items:center;gap:5px;color:#aaa}
+  #ui input[type=range]{width:90px;padding:0}
+  #ui label span{color:#ddd;min-width:34px}
+  #ui a.home{background:#16161c;color:#eee;border:1px solid #444;border-radius:6px;padding:5px 9px;font-size:13px;text-decoration:none}
+  #ui a.home:hover{border-color:#999}
+  #hint{position:fixed;right:12px;bottom:10px;color:#555;font-size:12px;z-index:10}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="ui">
+  <a class="home" href="index.html" title="Wróć do menu">&#9776;</a>
+  <input id="seed" placeholder="seed" spellcheck="false">
+  <button id="apply" title="Wygeneruj lawę z wpisanego seeda">Zastosuj</button>
+  <button id="newSeed" title="Losowy seed">&#128293; Nowa lawa</button>
+  <select id="res" title="Rozdzielczość">
+    <option value="1920x1080" selected>1920&times;1080</option>
+    <option value="1080x1080">1080&times;1080</option>
+    <option value="1080x1920">1080&times;1920</option>
+  </select>
+  <button id="play" title="Pauza / wznów">&#9208;</button>
+  <select id="dur" title="Długość nagrania (s)">
+    <option value="5">5 s</option>
+    <option value="10" selected>10 s</option>
+    <option value="15">15 s</option>
+    <option value="30">30 s</option>
+    <option value="60">60 s</option>
+  </select>
+  <button id="rec">&#9210; Nagraj WebM</button>
+  <button id="png" title="Zapisz klatkę jako PNG">PNG</button>
+  <label title="Prędkość unoszenia bąbli">tempo
+    <input type="range" id="spdS" min="0" max="3" step="0.1" value="1"><span id="spdV">1.0</span></label>
+  <label title="Jak łatwo bąble się sklejają">lepkość
+    <input type="range" id="gooS" min="0.4" max="2" step="0.1" value="1"><span id="gooV">1.0</span></label>
+  <label title="Liczba bąbli (przebudowuje scenę)">bąble
+    <input type="range" id="denS" min="0.5" max="1.6" step="0.1" value="1"><span id="denV">1.0</span></label>
+  <span id="status"></span>
+</div>
+<div id="hint">N = nowa lawa &middot; spacja = pauza</div>
+<script>
+'use strict';
+const TAU = Math.PI * 2;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', { alpha: false }); // nieprzezroczysta kanwa = szybszy compositing
+const seedInput = document.getElementById('seed');
+const statusEl = document.getElementById('status');
+
+/* ---------- deterministyczny RNG ---------- */
+function hashSeed(str){
+  let h = 1779033703 ^ str.length;
+  for(let i = 0; i < str.length; i++){
+    h = Math.imul(h ^ str.charCodeAt(i), 3432918353);
+    h = h << 13 | h >>> 19;
+  }
+  h = Math.imul(h ^ h >>> 16, 2246822507);
+  h = Math.imul(h ^ h >>> 13, 3266489909);
+  return (h ^ h >>> 16) >>> 0;
+}
+function mulberry32(a){
+  return function(){
+    a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+/* ---------- stan ---------- */
+let W = 1920, H = 1080;
+let scene = null, oldScene = null, transStart = 0, transCurDur = 2;
+let playing = true, simT = 0, lavT = 0, last = performance.now();
+let speedMul = 1, gooMul = 1, density = 1;
+
+// ChromaDepth: warstwa bliska = czerwień, daleka = błękit; środek spektrum ściśnięty
+const clampHue = h => Math.max(0, Math.min(250, h));
+const hueOf = d => clampHue(250 * (0.5 + 0.5 * Math.sign(2*d - 1) * Math.pow(Math.abs(2*d - 1), 0.45)));
+const col = (h, l, a) => a === undefined ? `hsl(${h},100%,${l}%)` : `hsla(${h},100%,${l}%,${a})`;
+
+/* ---------- scena ---------- */
+function buildScene(seedStr){
+  const h = hashSeed(seedStr);
+  const rnd = mulberry32(h);
+  const R  = (a,b) => a + rnd()*(b-a);
+  const RI = (a,b) => Math.floor(R(a, b + 0.999));
+  const mn = Math.min(W, H);
+  const L = RI(6, 8);
+  const layers = [];
+  for(let i = 0; i < L; i++){       // i=0 najdalej (rysowana pierwsza)
+    const d = 1 - i/(L - 1);        // 1 daleko → błękit, 0 blisko → czerwień
+    const near = 1 - d;
+    const nB = Math.max(1, Math.round(RI(2, 4) * density));
+    const blobs = [];
+    for(let b = 0; b < nB; b++){
+      blobs.push({
+        xf: R(0.08, 0.92), driftAf: R(0.015, 0.06), driftW: R(0.05, 0.2),
+        cycW: R(0.16, 0.42), ph: R(0, TAU),
+        rf: R(0.7, 1.3), pulseW: R(0.3, 0.8), pulsePh: R(0, TAU)
+      });
+    }
+    const poolHarm = [
+      { f: R(0.004, 0.01), a: R(0.5, 1), p: R(0, TAU), s: R(-0.4, 0.4) },
+      { f: R(0.012, 0.025), a: R(0.2, 0.5), p: R(0, TAU), s: R(-0.7, 0.7) }
+    ];
+    const bubbles = [];
+    const nBu = RI(2, 4);
+    for(let b = 0; b < nBu; b++){
+      bubbles.push({ xf: R(0.05, 0.95), w: R(0.02, 0.05), ph: R(0, 1), rr: R(0.008, 0.02) });
+    }
+    layers.push({
+      idx: i, d, hue: hueOf(d),
+      rBase: mn * (0.045 + 0.085 * Math.pow(near, 1.3)),
+      poolY: H * (0.80 + 0.14 * near),
+      poolAmp: H * 0.012 * (0.5 + near),
+      poolHarm, blobs, bubbles,
+      light: 50 - 6 * d                 // dalekie odrobinę ciemniejsze (mgła)
+    });
+  }
+  return { hash: h, seed: seedStr, L, layers };
+}
+
+function poolSurf(ly, x, t){
+  let y = ly.poolY;
+  for(const hm of ly.poolHarm) y -= ly.poolAmp * hm.a * Math.sin(x * hm.f + hm.p + hm.s * t);
+  return y;
+}
+
+/* ---------- metaball goo: mostek między dwoma kołami ---------- */
+function gooBridge(x1, y1, r1, x2, y2, r2, maxDist){
+  const dx = x2 - x1, dy = y2 - y1;
+  const d = Math.hypot(dx, dy);
+  if(d > maxDist || d <= Math.abs(r1 - r2) || d < 0.001) return;
+  const overlap = d < r1 + r2;
+  const u1 = overlap ? Math.acos(Math.max(-1, Math.min(1, (r1*r1 + d*d - r2*r2) / (2*r1*d)))) : 0;
+  const u2 = overlap ? Math.acos(Math.max(-1, Math.min(1, (r2*r2 + d*d - r1*r1) / (2*r2*d)))) : 0;
+  const ang = Math.atan2(dy, dx);
+  const maxSpread = Math.acos(Math.max(-1, Math.min(1, (r1 - r2) / d)));
+  const v = 0.5;
+  const a1 = ang + u1 + (maxSpread - u1) * v;
+  const a2 = ang - u1 - (maxSpread - u1) * v;
+  const a3 = ang + Math.PI - u2 - (Math.PI - u2 - maxSpread) * v;
+  const a4 = ang - Math.PI + u2 + (Math.PI - u2 - maxSpread) * v;
+  const p1x = x1 + r1*Math.cos(a1), p1y = y1 + r1*Math.sin(a1);
+  const p2x = x1 + r1*Math.cos(a2), p2y = y1 + r1*Math.sin(a2);
+  const p3x = x2 + r2*Math.cos(a3), p3y = y2 + r2*Math.sin(a3);
+  const p4x = x2 + r2*Math.cos(a4), p4y = y2 + r2*Math.sin(a4);
+  const totalR = r1 + r2;
+  const hs = Math.min(v * 2.4, Math.hypot(p3x - p1x, p3y - p1y) / totalR) * Math.min(1, d * 2 / totalR);
+  const hr1 = r1 * hs, hr2 = r2 * hs;
+  ctx.beginPath();
+  ctx.moveTo(p1x, p1y);
+  ctx.bezierCurveTo(
+    p1x + hr1*Math.cos(a1 - Math.PI/2), p1y + hr1*Math.sin(a1 - Math.PI/2),
+    p3x + hr2*Math.cos(a3 + Math.PI/2), p3y + hr2*Math.sin(a3 + Math.PI/2),
+    p3x, p3y);
+  ctx.lineTo(p4x, p4y);
+  ctx.bezierCurveTo(
+    p4x + hr2*Math.cos(a4 - Math.PI/2), p4y + hr2*Math.sin(a4 - Math.PI/2),
+    p2x + hr1*Math.cos(a2 + Math.PI/2), p2y + hr1*Math.sin(a2 + Math.PI/2),
+    p2x, p2y);
+  ctx.closePath();
+  ctx.fill();
+}
+
+/* ---------- rysowanie ---------- */
+function drawLava(sc, t, alphaMul){
+  ctx.globalAlpha = alphaMul;
+  for(const ly of sc.layers){        // od najdalszej (błękit) do najbliższej (czerwień)
+    ctx.fillStyle = col(ly.hue, ly.light);
+    // pula na dnie z falującą powierzchnią
+    ctx.beginPath();
+    ctx.moveTo(-4, H + 4);
+    for(let x = -4; x <= W + 16; x += 16) ctx.lineTo(x, poolSurf(ly, x, t));
+    ctx.lineTo(W + 4, H + 4);
+    ctx.closePath();
+    ctx.fill();
+    // bąble główne: cykl wznoszenia z zawisaniem (cosinus zwalnia na krańcach)
+    const pts = [];
+    for(const b of ly.blobs){
+      const cyc = 0.5 - 0.5 * Math.cos(lavT * b.cycW + b.ph);
+      const x = (b.xf + b.driftAf * Math.sin(lavT * b.driftW + b.ph * 1.7)) * W;
+      const y = ly.poolY - cyc * (ly.poolY - H * 0.12);
+      const r = ly.rBase * b.rf * (1 + 0.06 * Math.sin(t * b.pulseW + b.pulsePh));
+      pts.push({ x, y, r });
+      ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fill();
+    }
+    // mostki goo: bąbel-bąbel (tylko w obrębie warstwy = ten sam kolor)
+    for(let a = 0; a < pts.length; a++){
+      for(let b = a + 1; b < pts.length; b++){
+        gooBridge(pts[a].x, pts[a].y, pts[a].r, pts[b].x, pts[b].y, pts[b].r,
+          (pts[a].r + pts[b].r) * 1.25 * gooMul);
+      }
+    }
+    // mostki goo: bąbel-pula (pula jako wielkie wirtualne koło pod powierzchnią)
+    for(const p of pts){
+      const sy = poolSurf(ly, p.x, t);
+      const gap = sy - (p.y + p.r);
+      if(gap < p.r * 1.6 * gooMul && gap > -p.r * 2){
+        const Rp = W * 0.8;
+        gooBridge(p.x, p.y, p.r, p.x, sy + Rp, Rp, Rp + p.r * 2.8 * gooMul);
+      }
+    }
+    // drobne bąbelki wznoszące się liniowo
+    for(const bu of ly.bubbles){
+      const rise = ((lavT * bu.w + bu.ph) % 1);
+      const x = bu.xf * W + 14 * Math.sin(rise * 9 + bu.ph * 7);
+      const y = ly.poolY - rise * (ly.poolY - H * 0.1);
+      ctx.beginPath(); ctx.arc(x, y, bu.rr * Math.min(W, H), 0, TAU); ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* ---------- pętla ---------- */
+function frame(now){
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if(playing){
+    simT += dt;
+    lavT += dt * speedMul; // osobny zegar lawy — suwak tempa bez skoków
+  }
+  if(scene){
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    if(oldScene){
+      const p = Math.min(1, (simT - transStart) / transCurDur);
+      const e = p * p * (3 - 2 * p);
+      drawLava(oldScene, simT, 1 - e);
+      drawLava(scene, simT, e);
+      if(p >= 1) oldScene = null;
+    } else {
+      drawLava(scene, simT, 1);
+    }
+  }
+  requestAnimationFrame(frame);
+}
+
+/* ---------- UI ---------- */
+function randomSeed(){ return Math.random().toString(36).slice(2, 8); }
+
+function setSeed(s){
+  seedInput.value = s;
+  if(scene){ oldScene = scene; transStart = simT; transCurDur = 2; }
+  scene = buildScene(s);
+  statusEl.textContent = `seed: ${s} · warstw ${scene.L}`;
+  try { history.replaceState(null, '', '?seed=' + encodeURIComponent(s)); } catch(e){}
+}
+
+function setResolution(val){
+  const [w, h] = val.split('x').map(Number);
+  W = w; H = h;
+  canvas.width = W; canvas.height = H;
+  if(seedInput.value){ scene = buildScene(seedInput.value); oldScene = null; } // wymiary wpisane w scenę
+}
+
+document.getElementById('newSeed').onclick = () => setSeed(randomSeed());
+document.getElementById('apply').onclick = () => setSeed(seedInput.value.trim() || randomSeed());
+seedInput.addEventListener('keydown', e => { if(e.key === 'Enter') setSeed(seedInput.value.trim() || randomSeed()); });
+document.getElementById('res').onchange = e => setResolution(e.target.value);
+const playBtn = document.getElementById('play');
+playBtn.onclick = () => { playing = !playing; playBtn.textContent = playing ? '⏸' : '▶'; };
+
+const spdS = document.getElementById('spdS'), spdV = document.getElementById('spdV');
+const gooS = document.getElementById('gooS'), gooV = document.getElementById('gooV');
+const denS = document.getElementById('denS'), denV = document.getElementById('denV');
+spdS.oninput = () => { speedMul = +spdS.value; spdV.textContent = speedMul.toFixed(1); };
+gooS.oninput = () => { gooMul = +gooS.value; gooV.textContent = gooMul.toFixed(1); };
+denS.oninput = () => { denV.textContent = (+denS.value).toFixed(1); };
+denS.onchange = () => { // przebudowa dopiero po puszczeniu suwaka, z łagodnym przejściem
+  density = +denS.value;
+  if(seedInput.value) setSeed(seedInput.value);
+};
+
+window.addEventListener('keydown', e => {
+  if(e.target === seedInput) return;
+  if(e.key === 'n' || e.key === 'N') setSeed(randomSeed());
+  if(e.key === ' '){ e.preventDefault(); playBtn.onclick(); }
+});
+
+/* ---------- nagrywanie ---------- */
+let recorder = null, recTimer = null, recTick = null;
+const recBtn = document.getElementById('rec');
+recBtn.onclick = () => {
+  if(recorder){ recorder.stop(); return; }
+  const stream = canvas.captureStream(60);
+  const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm';
+  recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 24000000 });
+  const chunks = [];
+  recorder.ondataavailable = e => { if(e.data.size) chunks.push(e.data); };
+  recorder.onstop = () => {
+    clearTimeout(recTimer); clearInterval(recTick);
+    const blob = new Blob(chunks, { type: 'video/webm' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `lawa-${seedInput.value}-${W}x${H}.webm`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    recorder = null;
+    recBtn.textContent = '⏺ Nagraj WebM';
+    recBtn.classList.remove('rec');
+    statusEl.textContent = `zapisano: ${a.download}`;
+  };
+  const secs = +document.getElementById('dur').value;
+  const tEnd = performance.now() + secs * 1000;
+  recorder.start();
+  recBtn.textContent = '⏹ Stop';
+  recBtn.classList.add('rec');
+  recTick = setInterval(() => {
+    statusEl.textContent = `nagrywanie... ${Math.max(0, (tEnd - performance.now()) / 1000).toFixed(1)} s`;
+  }, 100);
+  recTimer = setTimeout(() => { if(recorder) recorder.stop(); }, secs * 1000);
+};
+
+document.getElementById('png').onclick = () => {
+  canvas.toBlob(blob => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `lawa-${seedInput.value}-${W}x${H}.png`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+};
+
+/* ---------- start ---------- */
+setResolution('1920x1080');
+const urlSeed = new URLSearchParams(location.search).get('seed');
+setSeed(urlSeed || randomSeed());
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

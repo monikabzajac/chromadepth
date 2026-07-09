@@ -55,6 +55,14 @@
       </div>
     </a>
 
+    <a class="card" href="lawa.html">
+      <canvas id="thLawa" width="640" height="360"></canvas>
+      <div class="body">
+        <h2>Lawa</h2>
+        <p>Lita neonowa lampa lava: bąble odrywają się od falującej puli, sklejają i rozdzielają. Bliskie warstwy czerwone, dalekie błękitne.</p>
+      </div>
+    </a>
+
     <div class="card soon">
       <div class="thumb">+</div>
       <div class="body">
@@ -143,6 +151,31 @@ const hue = f => `hsl(${Math.max(0, Math.min(250, 250*f))},100%,55%)`;
   }
   x.fillStyle = '#000';
   x.beginPath(); x.arc(cx, cy, 7, 0, TAU); x.fill();
+})();
+
+// miniatura lawy: warstwy puli z bąblami, czerwień z przodu → błękit w głębi
+(function(){
+  const c = document.getElementById('thLawa'), x = c.getContext('2d');
+  const Wt = c.width, Ht = c.height;
+  const Lt = 5;
+  for(let i = 0; i < Lt; i++){
+    const d = 1 - i/(Lt - 1);
+    x.fillStyle = hue(d);
+    const py = Ht * (0.55 + 0.4 * (i + 1)/Lt);
+    // pula
+    x.beginPath();
+    x.moveTo(0, Ht);
+    for(let px = 0; px <= Wt; px += 8) x.lineTo(px, py - 6*Math.sin(px*0.02 + i*1.9));
+    x.lineTo(Wt, Ht);
+    x.closePath(); x.fill();
+    // bąble nad pulą
+    const r = 9 + (1-d)*17;
+    for(let g = 0; g < 2; g++){
+      const bx = Wt*(0.2 + 0.5*g + 0.11*i);
+      const by = py - (30 + 55*((g + i*0.4) % 1)) - r;
+      x.beginPath(); x.arc(bx, by, r, 0, TAU); x.fill();
+    }
+  }
 })();
 </script>
 </body>
