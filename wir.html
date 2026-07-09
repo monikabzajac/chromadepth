@@ -101,11 +101,10 @@ function buildScene(seedStr){
   const R  = (a,b) => a + rnd()*(b-a);
   const RI = (a,b) => Math.floor(R(a, b + 0.999));
   const pick = arr => arr[Math.floor(rnd()*arr.length)];
-  return {
+  const sc = {
     hash: h, seed: seedStr,
     arms: RI(2, 5),
     twist: R(0.55, 1.6) * pick([1, -1]),   // skręt spirali logarytmicznej (θ = twist·ln r)
-    rotSpeed: R(0.25, 0.7) * pick([1, -1]),
     rot0: R(0, TAU),
     rMin: Math.min(W, H) * R(0.02, 0.045),
     rMax: Math.hypot(W, H) / 2 * 1.03,
@@ -115,6 +114,9 @@ function buildScene(seedStr){
     flowA: R(4, 9), flowK: R(2, 5), flowW: R(1, 3), // fala jasności płynąca ku środkowi (zasysanie)
     breathA: R(0.01, 0.04), breathW: R(0.2, 0.5)
   };
+  // znak obrotu PRZECIWNY do skrętu → pozorny przepływ d(ln r)/dt = rotSpeed/twist < 0, czyli ZASYSANIE
+  sc.rotSpeed = R(0.25, 0.7) * (sc.twist > 0 ? -1 : 1);
+  return sc;
 }
 
 /* ---------- rysowanie ---------- */
@@ -141,7 +143,7 @@ function drawVortex(sc, t, alphaMul){
       const wob = 1 + sc.wobble * Math.sin(lr0 * 3 + t * 0.7 + a);
       const w = Math.min(slotHalf * 0.49, slotHalf * 0.98 * Math.min(1, sc.armWidth * density) * wob * 0.5 * 2);
       const d = 1 - u0;                    // środek = daleko (błękit), brzeg = blisko (czerwień)
-      const l = 50 + sc.flowA * Math.sin(lr0 * sc.flowK - t * sc.flowW + a * 1.7);
+      const l = 50 + sc.flowA * Math.sin(lr0 * sc.flowK + t * sc.flowW + a * 1.7); // fala jasności płynie DO środka
       ctx.fillStyle = col(hueOf(d), l);
       ctx.beginPath();
       ctx.arc(0, 0, r0, th0 - w, th0 + w);              // wewnętrzna krawędź (łuk)
