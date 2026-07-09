@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<title>ChromaDepth Vortex</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,Segoe UI,sans-serif}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  canvas{max-width:100vw;max-height:100vh;display:block;background:#000}
+  #ui{position:fixed;left:12px;top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+      background:rgba(10,10,14,.85);border:1px solid #333;border-radius:10px;padding:8px 10px;
+      color:#ccc;font-size:13px;z-index:10}
+  #ui input,#ui select,#ui button{background:#16161c;color:#eee;border:1px solid #444;border-radius:6px;padding:5px 9px;font-size:13px}
+  #ui button{cursor:pointer}
+  #ui button:hover{border-color:#999}
+  #ui button.rec{background:#5a1111;border-color:#a33}
+  #seed{width:100px}
+  #status{color:#7c7}
+  #ui label{display:flex;align-items:center;gap:5px;color:#aaa}
+  #ui input[type=range]{width:90px;padding:0}
+  #ui label span{color:#ddd;min-width:34px}
+  #ui a.home{background:#16161c;color:#eee;border:1px solid #444;border-radius:6px;padding:5px 9px;font-size:13px;text-decoration:none}
+  #ui a.home:hover{border-color:#999}
+  #hint{position:fixed;right:12px;bottom:10px;color:#555;font-size:12px;z-index:10}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="ui">
+  <a class="home" href="index.html" title="Wróć do menu">&#9776;</a>
+  <input id="seed" placeholder="seed" spellcheck="false">
+  <button id="apply" title="Wygeneruj wir z wpisanego seeda">Zastosuj</button>
+  <button id="newSeed" title="Losowy seed">&#127744; Nowy wir</button>
+  <select id="res" title="Rozdzielczość">
+    <option value="1920x1080" selected>1920&times;1080</option>
+    <option value="1080x1080">1080&times;1080</option>
+    <option value="1080x1920">1080&times;1920</option>
+  </select>
+  <button id="play" title="Pauza / wznów">&#9208;</button>
+  <select id="dur" title="Długość nagrania (s)">
+    <option value="5">5 s</option>
+    <option value="10" selected>10 s</option>
+    <option value="15">15 s</option>
+    <option value="30">30 s</option>
+    <option value="60">60 s</option>
+  </select>
+  <button id="rec">&#9210; Nagraj WebM</button>
+  <button id="png" title="Zapisz klatkę jako PNG">PNG</button>
+  <label title="Prędkość wirowania">tempo
+    <input type="range" id="spdS" min="0" max="3" step="0.1" value="1"><span id="spdV">1.0</span></label>
+  <label title="Jak mocno spirala jest skręcona">skręt
+    <input type="range" id="twS" min="0.2" max="2" step="0.1" value="1"><span id="twV">1.0</span></label>
+  <label title="Szerokość ramion (reszta to czerń)">ramiona
+    <input type="range" id="denS" min="0.3" max="1.4" step="0.05" value="1"><span id="denV">1.0</span></label>
+  <span id="status"></span>
+</div>
+<div id="hint">N = nowy wir &middot; spacja = pauza</div>
+<script>
+'use strict';
+const TAU = Math.PI * 2;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', { alpha: false }); // nieprzezroczysta kanwa = szybszy compositing
+const seedInput = document.getElementById('seed');
+const statusEl = document.getElementById('status');
+
+/* ---------- deterministyczny RNG ---------- */
+function hashSeed(str){
+  let h = 1779033703 ^ str.length;
+  for(let i = 0; i < str.length; i++){
+    h = Math.imul(h ^ str.charCodeAt(i), 3432918353);
+    h = h << 13 | h >>> 19;
+  }
+  h = Math.imul(h ^ h >>> 16, 2246822507);
+  h = Math.imul(h ^ h >>> 13, 3266489909);
+  return (h ^ h >>> 16) >>> 0;
+}
+function mulberry32(a){
+  return function(){
+    a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+/* ---------- stan ---------- */
+let W = 1920, H = 1080;
+let scene = null, oldScene = null, transStart = 0, transCurDur = 2;
+let playing = true, simT = 0, rotT = 0, last = performance.now();
+let speedMul = 1, twistTarget = 1, curTwist = 1, density = 1;
+
+// ChromaDepth: brzeg = czerwień (blisko), środek wiru = błękit (daleko) → lej w głąb ekranu
+const clampHue = h => Math.max(0, Math.min(250, h));
+const hueOf = d => clampHue(250 * (0.5 + 0.5 * Math.sign(2*d - 1) * Math.pow(Math.abs(2*d - 1), 0.45)));
+const col = (h, l, a) => a === undefined ? `hsl(${h},100%,${l}%)` : `hsla(${h},100%,${l}%,${a})`;
+
+/* ---------- scena ---------- */
+function buildScene(seedStr){
+  const h = hashSeed(seedStr);
+  const rnd = mulberry32(h);
+  const R  = (a,b) => a + rnd()*(b-a);
+  const RI = (a,b) => Math.floor(R(a, b + 0.999));
+  const pick = arr => arr[Math.floor(rnd()*arr.length)];
+  return {
+    hash: h, seed: seedStr,
+    arms: RI(2, 5),
+    twist: R(0.55, 1.6) * pick([1, -1]),   // skręt spirali logarytmicznej (θ = twist·ln r)
+    rotSpeed: R(0.25, 0.7) * pick([1, -1]),
+    rot0: R(0, TAU),
+    rMin: Math.min(W, H) * R(0.02, 0.045),
+    rMax: Math.hypot(W, H) / 2 * 1.03,
+    steps: 120,
+    armWidth: R(0.55, 0.9),                // ułamek slotu; reszta = czarna przerwa (kolory się nie stykają)
+    wobble: R(0, 0.22),                    // organiczne falowanie szerokości ramion
+    flowA: R(4, 9), flowK: R(2, 5), flowW: R(1, 3), // fala jasności płynąca ku środkowi (zasysanie)
+    breathA: R(0.01, 0.04), breathW: R(0.2, 0.5)
+  };
+}
+
+/* ---------- rysowanie ---------- */
+function drawVortex(sc, t, alphaMul){
+  ctx.globalAlpha = alphaMul;
+  ctx.save();
+  ctx.translate(W/2, H/2);
+  ctx.rotate(sc.rot0 + rotT * sc.rotSpeed);
+  const breath = 1 + sc.breathA * Math.sin(t * sc.breathW);
+  ctx.scale(breath, breath);
+  const lnMin = Math.log(sc.rMin), lnMax = Math.log(sc.rMax);
+  const n = sc.steps;
+  const slotHalf = TAU / sc.arms / 2;
+  const tw = sc.twist * curTwist;
+  for(let a = 0; a < sc.arms; a++){
+    const base = a * TAU / sc.arms;
+    for(let i = 0; i < n; i++){
+      const u0 = i/n, u1 = (i+1)/n;
+      const lr0 = lnMin + (lnMax - lnMin) * u0;
+      const lr1 = lnMin + (lnMax - lnMin) * u1 + 0.012; // maleńka zakładka przeciw szparom
+      const r0 = Math.exp(lr0), r1 = Math.exp(lr1);
+      const th0 = base + tw * lr0;
+      const th1 = base + tw * lr1;
+      const wob = 1 + sc.wobble * Math.sin(lr0 * 3 + t * 0.7 + a);
+      const w = Math.min(slotHalf * 0.49, slotHalf * 0.98 * Math.min(1, sc.armWidth * density) * wob * 0.5 * 2);
+      const d = 1 - u0;                    // środek = daleko (błękit), brzeg = blisko (czerwień)
+      const l = 50 + sc.flowA * Math.sin(lr0 * sc.flowK - t * sc.flowW + a * 1.7);
+      ctx.fillStyle = col(hueOf(d), l);
+      ctx.beginPath();
+      ctx.arc(0, 0, r0, th0 - w, th0 + w);              // wewnętrzna krawędź (łuk)
+      ctx.lineTo(r1 * Math.cos(th1 + w), r1 * Math.sin(th1 + w));
+      ctx.arc(0, 0, r1, th1 + w, th1 - w, true);        // zewnętrzna krawędź (łuk wstecz)
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+  // oko wiru: błękitna poświata (najdalej) i czarna dziura
+  ctx.fillStyle = col(250, 38, 0.55);
+  ctx.beginPath(); ctx.arc(0, 0, sc.rMin * 1.6, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#000';
+  ctx.beginPath(); ctx.arc(0, 0, sc.rMin * 0.95, 0, TAU); ctx.fill();
+  ctx.restore();
+  ctx.globalAlpha = 1;
+}
+
+/* ---------- pętla ---------- */
+function frame(now){
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if(playing){
+    simT += dt;
+    rotT += dt * speedMul; // osobny zegar wirowania — suwak tempa bez skoków
+  }
+  curTwist += (twistTarget - curTwist) * Math.min(1, dt * 1.5); // wygładzony skręt
+  if(scene){
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    if(oldScene){
+      const p = Math.min(1, (simT - transStart) / transCurDur);
+      const e = p * p * (3 - 2 * p);
+      drawVortex(oldScene, simT, 1 - e);
+      drawVortex(scene, simT, e);
+      if(p >= 1) oldScene = null;
+    } else {
+      drawVortex(scene, simT, 1);
+    }
+  }
+  requestAnimationFrame(frame);
+}
+
+/* ---------- UI ---------- */
+function randomSeed(){ return Math.random().toString(36).slice(2, 8); }
+
+function setSeed(s){
+  seedInput.value = s;
+  if(scene){ oldScene = scene; transStart = simT; transCurDur = 2; }
+  scene = buildScene(s);
+  statusEl.textContent = `seed: ${s} · ramion ${scene.arms}`;
+  try { history.replaceState(null, '', '?seed=' + encodeURIComponent(s)); } catch(e){}
+}
+
+function setResolution(val){
+  const [w, h] = val.split('x').map(Number);
+  W = w; H = h;
+  canvas.width = W; canvas.height = H;
+  if(seedInput.value){ scene = buildScene(seedInput.value); oldScene = null; } // wymiary wpisane w scenę
+}
+
+document.getElementById('newSeed').onclick = () => setSeed(randomSeed());
+document.getElementById('apply').onclick = () => setSeed(seedInput.value.trim() || randomSeed());
+seedInput.addEventListener('keydown', e => { if(e.key === 'Enter') setSeed(seedInput.value.trim() || randomSeed()); });
+document.getElementById('res').onchange = e => setResolution(e.target.value);
+const playBtn = document.getElementById('play');
+playBtn.onclick = () => { playing = !playing; playBtn.textContent = playing ? '⏸' : '▶'; };
+
+const spdS = document.getElementById('spdS'), spdV = document.getElementById('spdV');
+const twS = document.getElementById('twS'), twV = document.getElementById('twV');
+const denS = document.getElementById('denS'), denV = document.getElementById('denV');
+spdS.oninput = () => { speedMul = +spdS.value; spdV.textContent = speedMul.toFixed(1); };
+twS.oninput = () => { twistTarget = +twS.value; twV.textContent = twistTarget.toFixed(1); };
+denS.oninput = () => { density = +denS.value; denV.textContent = density.toFixed(2); };
+
+window.addEventListener('keydown', e => {
+  if(e.target === seedInput) return;
+  if(e.key === 'n' || e.key === 'N') setSeed(randomSeed());
+  if(e.key === ' '){ e.preventDefault(); playBtn.onclick(); }
+});
+
+/* ---------- nagrywanie ---------- */
+let recorder = null, recTimer = null, recTick = null;
+const recBtn = document.getElementById('rec');
+recBtn.onclick = () => {
+  if(recorder){ recorder.stop(); return; }
+  const stream = canvas.captureStream(60);
+  const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm';
+  recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 24000000 });
+  const chunks = [];
+  recorder.ondataavailable = e => { if(e.data.size) chunks.push(e.data); };
+  recorder.onstop = () => {
+    clearTimeout(recTimer); clearInterval(recTick);
+    const blob = new Blob(chunks, { type: 'video/webm' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `wir-${seedInput.value}-${W}x${H}.webm`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    recorder = null;
+    recBtn.textContent = '⏺ Nagraj WebM';
+    recBtn.classList.remove('rec');
+    statusEl.textContent = `zapisano: ${a.download}`;
+  };
+  const secs = +document.getElementById('dur').value;
+  const tEnd = performance.now() + secs * 1000;
+  recorder.start();
+  recBtn.textContent = '⏹ Stop';
+  recBtn.classList.add('rec');
+  recTick = setInterval(() => {
+    statusEl.textContent = `nagrywanie... ${Math.max(0, (tEnd - performance.now()) / 1000).toFixed(1)} s`;
+  }, 100);
+  recTimer = setTimeout(() => { if(recorder) recorder.stop(); }, secs * 1000);
+};
+
+document.getElementById('png').onclick = () => {
+  canvas.toBlob(blob => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `wir-${seedInput.value}-${W}x${H}.png`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+};
+
+/* ---------- start ---------- */
+setResolution('1920x1080');
+const urlSeed = new URLSearchParams(location.search).get('seed');
+setSeed(urlSeed || randomSeed());
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

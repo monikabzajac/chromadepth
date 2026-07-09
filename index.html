@@ -47,6 +47,14 @@
       </div>
     </a>
 
+    <a class="card" href="wir.html">
+      <canvas id="thWir" width="640" height="360"></canvas>
+      <div class="body">
+        <h2>Wir</h2>
+        <p>Hipnotyczny vortex z litych spiralnych ramion. Czerwony brzeg blisko, błękitne oko daleko — lej wciągający w głąb ekranu.</p>
+      </div>
+    </a>
+
     <div class="card soon">
       <div class="thumb">+</div>
       <div class="body">
@@ -108,6 +116,33 @@ const hue = f => `hsl(${Math.max(0, Math.min(250, 250*f))},100%,55%)`;
     x.stroke();
   }
   x.globalAlpha = 1;
+})();
+
+// miniatura wiru: spiralne ramiona, czerwień na brzegu → błękit w oku
+(function(){
+  const c = document.getElementById('thWir'), x = c.getContext('2d');
+  const cx = c.width/2, cy = c.height/2;
+  const arms = 3, n = 60, tw = 1.1;
+  const lnMin = Math.log(6), lnMax = Math.log(230);
+  for(let a = 0; a < arms; a++){
+    const base = a * TAU / arms;
+    for(let i = 0; i < n; i++){
+      const u0 = i/n;
+      const lr0 = lnMin + (lnMax - lnMin) * u0;
+      const lr1 = lnMin + (lnMax - lnMin) * (i+1)/n + 0.02;
+      const r0 = Math.exp(lr0), r1 = Math.exp(lr1);
+      const th0 = base + tw*lr0, th1 = base + tw*lr1;
+      const w = TAU/arms * 0.36;
+      x.fillStyle = hue(1 - u0);
+      x.beginPath();
+      x.arc(cx, cy, r0, th0 - w, th0 + w);
+      x.lineTo(cx + r1*Math.cos(th1 + w), cy + r1*Math.sin(th1 + w));
+      x.arc(cx, cy, r1, th1 + w, th1 - w, true);
+      x.closePath(); x.fill();
+    }
+  }
+  x.fillStyle = '#000';
+  x.beginPath(); x.arc(cx, cy, 7, 0, TAU); x.fill();
 })();
 </script>
 </body>
