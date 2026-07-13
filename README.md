@@ -2,7 +2,7 @@
 
 Kolekcja animacji generative art pod okulary ChromaDepth — czyste barwy spektralne na czarnym tle (czerwień = blisko, błękit = daleko). Narzędzie do seryjnego produkowania filmików.
 
-**Live:** https://chromadepth-liard.vercel.app
+**Live:** https://chromadepth-studio.vercel.app
 
 ## Strony
 
